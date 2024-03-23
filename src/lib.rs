@@ -1,84 +1,88 @@
 use borsh::{BorshDeserialize, BorshSerialize};
-use solana_program::declare_id;
 use solana_program::{
-    account_info::{next_account_info, AccountInfo},
+    account_info::{AccountInfo, next_account_info},
     entrypoint,
     entrypoint::ProgramResult,
     pubkey::Pubkey,
-    rent::Rent,
-    sysvar::Sysvar,
     program_error::ProgramError,
-    system_instruction,
+    msg,
 };
 
-// Using a dummy Program ID for now;
-declare_id!("C7zRsz9L1FYfqf6AcFnQGgLHDCp1E5inkfR9xMZFqZsz");
-
 #[derive(BorshSerialize, BorshDeserialize, Debug)]
-pub struct NftMetadata {
+pub struct MintNftInstruction {
     pub ipfs_link: String,
 }
 
-#[derive(BorshSerialize, BorshDeserialize, Debug)]
-pub struct UserAddresses {
-    pub addresses: Vec<Pubkey>,
+#[derive(BorshSerialize, BorshDeserialize, Debug, Default)]
+pub struct NftRecord {
+    pub minter: Pubkey,
+    pub ipfs_link: String,
 }
 
-// Program entrypoint
+#[derive(BorshSerialize, BorshDeserialize, Debug, Default)]
+pub struct NftMintingRecords {
+    pub records: Vec<NftRecord>,
+}
+
 entrypoint!(process_instruction);
+
 fn process_instruction(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
-    let account_info_iter = &mut accounts.iter();
-    let mint_account = next_account_info(account_info_iter)?;
-    let payer_account = next_account_info(account_info_iter)?;
-    let system_program = next_account_info(account_info_iter)?;
-    let user_addresses_account = next_account_info(account_info_iter)?;
+    msg!("Mint NFT instruction called");
 
-    if !user_addresses_account.is_writable {
-        return Err(ProgramError::InvalidAccountData);
-    }
+    let accounts_iter = &mut accounts.iter();
+    let minter_account = next_account_info(accounts_iter)?;
+    let state_account = next_account_info(accounts_iter)?;
 
-    // Deserialize the instruction data to NftMetadata
-    let ipfs_link = NftMetadata::try_from_slice(instruction_data)?;
+    let instruction: MintNftInstruction = MintNftInstruction::try_from_slice(instruction_data)?;
+    msg!("IPFS Link: {}", instruction.ipfs_link);
 
-    // Determine a fixed size for the NftMetadata storage; adjust as needed
-    let metadata_storage_size: usize = 1024; // Example fixed size
-
-    // Calculate the required lamports to make the mint_account rent-exempt for the fixed size
-    let rent = Rent::get()?;
-    let required_lamports = rent.minimum_balance(metadata_storage_size);
-
-    let create_account_instruction = system_instruction::create_account(
-        payer_account.key,
-        mint_account.key,
-        required_lamports,
-        metadata_storage_size as u64,
-        program_id,
-    );
-
-    solana_program::program::invoke_signed(
-        &create_account_instruction,
-        &[payer_account.clone(), mint_account.clone(), system_program.clone()],
-        &[],
-    )?;
-
-    // Serialize and store the IPFS link in the newly created account
-    ipfs_link.serialize(&mut *mint_account.data.borrow_mut())?;
-
-    // Attempt to deserialize user addresses, append the new address, and serialize again
-    let mut user_addresses: UserAddresses = match UserAddresses::try_from_slice(&user_addresses_account.data.borrow()) {
-        Ok(data) => data,
-        Err(_) => UserAddresses { addresses: Vec::new() }, // Initialize if not already set up
+    let mut minting_records: NftMintingRecords = match NftMintingRecords::try_from_slice(&state_account.data.borrow()) {
+        Ok(data) => {
+            msg!("Successfully deserialized NftMintingRecords.");
+            data
+        },
+        Err(_) => {
+            msg!("Failed to deserialize NftMintingRecords or account is empty, initializing new.");
+            NftMintingRecords::default()
+        }
     };
 
-    if !user_addresses.addresses.contains(payer_account.key) {
-        user_addresses.addresses.push(*payer_account.key);
-        user_addresses.serialize(&mut *user_addresses_account.data.borrow_mut())?;
+    // Create a new NFT record for the current minting operation
+    let new_record = NftRecord {
+        minter: *minter_account.key,
+        ipfs_link: instruction.ipfs_link.clone(),
+    };
+    minting_records.records.push(new_record);
+
+    let serialized_data = match minting_records.try_to_vec() {
+        Ok(data) => data,
+        Err(e) => {
+            msg!("Failed to serialize NftMintingRecords: {:?}", e);
+            return Err(ProgramError::from(e));
+        }
+    };
+
+    if serialized_data.len() > state_account.data.borrow().len() {
+        msg!("Error: Serialized data size exceeds the account's allocated space.");
+        return Err(ProgramError::AccountDataTooSmall);
     }
+
+    let mut data = state_account.data.borrow_mut();
+    if serialized_data.len() > data.len() {
+        msg!("Error: Serialized data size exceeds the account's allocated space.");
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    // Safely copy serialized data into the state account
+    for (i, byte) in serialized_data.iter().enumerate() {
+        data[i] = *byte;
+    }
+
+    msg!("NftMintingRecords successfully saved to state account.");
 
     Ok(())
 }
-
